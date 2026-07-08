@@ -38,7 +38,7 @@ variable "NUGET_SOURCE_PATH" {
 }
 
 variable "CACHE_BUST" {
-  default = "2"
+  default = "3"
 }
 
 variable "BRANDING_DIR" {
