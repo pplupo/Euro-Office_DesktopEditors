@@ -195,108 +195,140 @@ Fixture convention: "1-sheet wb" = workbook with a single sheet "Sheet1", A1:C3 
 
 ### C1. Sheet management
 
+Backing API confirmed in `sdkjs/cell/apiBuilder.js`: `Api.AddSheet(sName)` (777, top-level `Api`, not `ApiWorkbook`) throws if `Api.GetSheet(sName)` already resolves a sheet with that name; `Api.GetSheets()`/`ApiWorkbook.GetSheets()` (799, 8173) return `ApiWorksheet[]`, not serializable directly -- `cell.getSheets` returns an array of names via `ApiWorksheet.GetName()` (8546), same established pattern. `ApiWorksheet.SetActive()` (8332) is on the worksheet, not `ApiWorkbook.SetActiveSheet`. `Api.GetSheet(nameOrIndex)` (867) resolves a sheet by name for target resolution.
+
 | ID | Setup | Input | Expected | Type |
 |---|---|---|---|---|
-| C1.1 | 1-sheet wb | `cell.addSheet{name:"Data"}` | `cell.getSheets{}` returns 2 sheets, including `"Data"` | Positive |
+| C1.1 | 1-sheet wb | `cell.addSheet{name:"Data"}` | returns `null`; `cell.getSheets{}` returns `["Sheet1","Data"]` | Positive |
 | C1.2 | 1-sheet wb | `cell.addSheet{name:"Sheet1"}` (duplicate name) | `Error{code: SCRIPT_EXCEPTION}` (Excel semantics disallow duplicate sheet names) | Negative |
 | C1.3 | Wb with sheets "Sheet1","Data" | `cell.setActiveSheet{name:"Data"}` then `cell.getActiveSheet{}` | returns `"Data"` | Positive |
-| C1.4 | 1-sheet wb | `cell.setVisible{name:"Sheet1", visible:false}` on the *only* sheet | `Error{code: SCRIPT_EXCEPTION}` (Excel disallows hiding the last visible sheet) | Negative |
-| C1.5 | Wb with sheet "Sheet1" | `cell.setName{oldName:"Sheet1", newName:"Renamed"}` | `cell.getSheets{}` no longer contains `"Sheet1"`, contains `"Renamed"` | Positive |
+| C1.4 | 1-sheet wb | `cell.setVisible{name:"Sheet1", visible:false}` on the *only* sheet | behavior depends on whether `worksheet.setHidden` itself enforces "can't hide the last visible sheet" -- not confirmed in `apiBuilder.js` (the check may live deeper in `AscCommonExcel`, not vendored/searched this pass); test result at the §6 build/deploy gate resolves this, not assumed here | Positive or Negative (unresolved -- verify at build/deploy gate) |
+| C1.5 | Wb with sheet "Sheet1" | `cell.setName{oldName:"Sheet1", newName:"Renamed"}` | returns `null`; `cell.getSheets{}` no longer contains `"Sheet1"`, contains `"Renamed"` | Positive |
 
 ### C2. Cell/range read & write
 
+Backing API confirmed: `ApiWorksheet.GetRange(Range1, Range2)` (`apiBuilder.js:8602`) resolves a range string on a given sheet; `ApiRange.SetValue(data)` (10161) has **no separate formula path** -- there is no `ApiRange.SetFormula` at all. Setting a cell's raw string value to something starting with `"="` is what makes it a formula (the same single setter Excel's own UI uses) -- corrected `cell.setValue`'s scope from separate `value`/`formula` fields down to one `value` field. `ApiRange.GetFormula()` (10241) returns `"= " + this.range.getFormula()` -- note the literal space after `=`, an unusual detail preserved here rather than assumed away.
+
 | ID | Setup | Input | Expected | Type |
 |---|---|---|---|---|
-| C2.1 | 1-sheet wb | `cell.setValue{sheet:"Sheet1", range:"A1", value:42}` | `cell.getValue{sheet:"Sheet1", range:"A1"}` returns `42` | Positive |
-| C2.2 | 1-sheet wb | `cell.setValue{sheet:"Sheet1", range:"A1", formula:"=1+1"}` | `cell.getFormula{sheet:"Sheet1", range:"A1"}` returns `"=1+1"`; `cell.getValue{...}` returns `2` (post-recalc) | Positive |
-| C2.3 | 1-sheet wb | `cell.setValue{sheet:"Sheet1", range:"ZZ99999999", value:1}` (out-of-grid-bounds range) | `Error{code: SCHEMA_INVALID}` or `SCRIPT_EXCEPTION}` depending on where the range grammar is validated | Negative |
+| C2.1 | 1-sheet wb | `cell.setValue{sheet:"Sheet1", range:"A1", value:42}` | returns `true`; `cell.getValue{sheet:"Sheet1", range:"A1"}` returns `42` | Positive |
+| C2.2 | 1-sheet wb | `cell.setValue{sheet:"Sheet1", range:"A1", value:"=1+1"}` | returns `true`; `cell.getFormula{sheet:"Sheet1", range:"A1"}` returns `"= 1+1"` (note the space); `cell.getValue{...}` returns `2` post-recalc | Positive |
+| C2.3 | 1-sheet wb | `cell.setValue{sheet:"Sheet1", range:"ZZ99999999", value:1}` (out-of-grid-bounds range) | `Error{code: SCRIPT_EXCEPTION}` -- `GetRange` throws when the range string doesn't resolve, not a gateway-schema-level rejection (range grammar isn't validated by a regex at the schema layer, deliberately, since Excel's range grammar is itself complex enough that re-validating it there would just duplicate `getRange2`'s own parsing) | Negative |
 | C2.4 | 1-sheet wb | `cell.getValue{sheet:"NoSuchSheet", range:"A1"}` | `Error{code: SCRIPT_EXCEPTION}` (sheet not found) | Negative |
 
 ### C3. Number formats, merge, clear
 
+Backing API confirmed: `ApiRange.SetNumberFormat(sFormat)`/`Merge(isAcross)`/`ClearContents()` (`apiBuilder.js:10828,10897,9759`) all return `null`/`undefined` on success (`SetNumberFormat`/`Merge` return `null` explicitly only on a protection failure, otherwise fall through with no return value). No "read formatted text" command is allowlisted yet (only `cell.getValue`, which returns the raw value, not the number-format-applied display string) -- C3.1's read-back is deferred to the §6 build/deploy gate rather than added as a new command speculatively.
+
 | ID | Setup | Input | Expected | Type |
 |---|---|---|---|---|
-| C3.1 | A1 = 1234.5 | `cell.setNumberFormat{sheet:"Sheet1", range:"A1", format:"0.00"}` | subsequent formatted-text read of A1 shows `"1234.50"` | Positive |
-| C3.2 | A1:B2 unmerged | `cell.merge{sheet:"Sheet1", range:"A1:B2"}` | reading A1:B2 as a range reports it merged; B1/A2/B2 are empty subordinate cells | Positive |
-| C3.3 | A1 = "text" | `cell.clearContents{sheet:"Sheet1", range:"A1"}` | `cell.getValue{...}` returns empty/null | Positive |
+| C3.1 | A1 = 1234.5 | `cell.setNumberFormat{sheet:"Sheet1", range:"A1", format:"0.00"}` | returns `null`; formatted-text read-back deferred (no allowlisted command reads it yet) | Positive |
+| C3.2 | A1:B2 unmerged | `cell.merge{sheet:"Sheet1", range:"A1:B2", across:false}` | returns `null` | Positive |
+| C3.3 | A1 = "text" | `cell.clearContents{sheet:"Sheet1", range:"A1"}` | returns `null`; `cell.getValue{...}` returns empty/null | Positive |
 
 ### C4. Copy/paste, find/replace
 
+Backing API confirmed: `ApiRange.Copy(destination)` (`apiBuilder.js:11338`) requires an actual `ApiRange` object as `destination`, not a string -- resolved via `ws.GetRange(scope.to)`. `ApiRange.Find(oSearchData)`/`Replace(oReplaceData)` (11616, 11764) are methods **on a range**, not a document/sheet-wide search -- `Find` returns **a single `ApiRange | null`** (the first match), not a list, so `cell.find`'s originally-planned "returns 2 matches" expectation doesn't correspond to any real capability of this method; corrected to reflect single-match semantics. Both operate over `ApiWorksheet.GetUsedRange()` (`apiBuilder.js:8524`) as the search scope, since no `range` scope field was in the original design and the real methods need one to call `.Find`/`.Replace` on. Result addresses read via `ApiRange.GetAddress()` (10043) rather than the unserializable `ApiRange` handle itself.
+
 | ID | Setup | Input | Expected | Type |
 |---|---|---|---|---|
-| C4.1 | A1 = "src" | `cell.copy{sheet:"Sheet1", from:"A1", to:"B1"}` | B1 == `"src"` | Positive |
-| C4.2 | A1:A3 contain "foo","bar","foo" | `cell.find{sheet:"Sheet1", text:"foo"}` | returns 2 matches: A1, A3 | Positive |
-| C4.3 | A1:A3 contain "foo","bar","foo" | `cell.replace{sheet:"Sheet1", find:"foo", replace:"baz"}` | A1 == A3 == `"baz"`, A2 unchanged | Positive |
+| C4.1 | A1 = "src" | `cell.copy{sheet:"Sheet1", from:"A1", to:"B1"}` | returns `null`; B1 == `"src"` | Positive |
+| C4.2 | A1:A3 contain "foo","bar","foo" | `cell.find{sheet:"Sheet1", text:"foo"}` | returns `"A1"` (the first match's address only -- `Find` has no "all matches" mode) | Positive |
+| C4.3 | A1:A3 contain "foo","bar","foo" | `cell.replace{sheet:"Sheet1", find:"foo", replace:"baz"}` | returns the matched range's address or `null` if nothing matched; underlying `Replace` semantics (single vs. all occurrences) determined by `ReplaceAll`, defaulted to `true` in the command's script since the gateway command has no per-call granularity control in this design | Positive |
 
 ### C5. Font/fill/border/alignment formatting
 
+Backing API confirmed: `ApiRange.SetFontName` (`apiBuilder.js:10513`) takes a plain string. `SetFillColor(oColor)` (10772) and `SetBorders(bordersIndex, lineStyle, oColor)` (from §C3's investigation, same file) both require a real `ApiColor` object, not a hex string -- built via `Api.CreateColorFromRGB(r,g,b)` (925), same r/g/b-from-hex decomposition already used for `word.setColor` (§B4). `SetBorders`'s `bordersIndex` switch (same method) has **no `"all"` case** -- only `DiagonalDown/DiagonalUp/Bottom/Left/Right/Top/InsideHorizontal/InsideVertical`; `edge:"all"` is handled by the command's script looping over the four outer edges, not a real single-call API mode. `SetAlignHorizontal` (10575) takes `'left'|'right'|'center'|'justify'` and returns `false` (not an exception) for an unrecognized value -- the command throws if that happens, keeping the gateway's own contract (schema-invalid inputs never reach here; this is a genuine unrecognized-but-schema-shaped case) consistent with everything else in this document.
+
 | ID | Setup | Input | Expected | Type |
 |---|---|---|---|---|
-| C5.1 | A1 default font | `cell.setFontName{sheet:"Sheet1", range:"A1", font:"Calibri"}` | font reads back `"Calibri"` | Positive |
-| C5.2 | A1 default fill | `cell.setFillColor{sheet:"Sheet1", range:"A1", color:"#FFFF00"}` | fill reads back `#FFFF00` | Positive |
-| C5.3 | A1 no borders | `cell.setBorders{sheet:"Sheet1", range:"A1", edge:"all", style:"thin"}` | all 4 edges read back `"thin"` | Positive |
-| C5.4 | A1 default align | `cell.setAlignHorizontal{sheet:"Sheet1", range:"A1", align:"center"}` | alignment reads back `"center"` | Positive |
+| C5.1 | A1 default font | `cell.setFontName{sheet:"Sheet1", range:"A1", font:"Calibri"}` | returns `null` | Positive |
+| C5.2 | A1 default fill | `cell.setFillColor{sheet:"Sheet1", range:"A1", color:"#FFFF00"}` | returns `null` | Positive |
+| C5.3 | A1 no borders | `cell.setBorders{sheet:"Sheet1", range:"A1", edge:"all", style:"thin", color:"#000000"}` | returns `null`; all 4 outer edges set via 4 internal `SetBorders` calls | Positive |
+| C5.4 | A1 default align | `cell.setAlignHorizontal{sheet:"Sheet1", range:"A1", align:"center"}` | returns `null` | Positive |
 
 ### C6. Conditional formatting
 
+Backing API confirmed: `ApiRange.GetFormatConditions()` (`apiBuilder.js:12827`) returns an `ApiFormatConditions` collection; `.Add*` methods (`AddColorScale(ColorScaleType)`, `AddDatabar()`, `AddIconSetCondition()`, lines 21119, 21229, 21299) each return the created rule object or `null` on failure, all JSON-unserializable -- commands return a boolean (`!!result`) instead, established pattern. `AddIconSetCondition()` takes **no parameters** -- the originally-planned `iconSet` scope field doesn't correspond to a constructor argument (icon-set type appears to be set via a property on the returned `ApiIconSetCondition`, not investigated further this pass since it's not needed to create a rule at all); dropped rather than guessed at.
+
 | ID | Setup | Input | Expected | Type |
 |---|---|---|---|---|
-| C6.1 | A1:A10 with numeric values | `cell.addColorScale{sheet:"Sheet1", range:"A1:A10"}` | reading the range's conditional formats returns 1 color-scale rule | Positive |
-| C6.2 | A1:A10 with numeric values | `cell.addDatabar{sheet:"Sheet1", range:"A1:A10"}` | 1 databar rule present | Positive |
-| C6.3 | A1:A10 with numeric values | `cell.addIconSetCondition{sheet:"Sheet1", range:"A1:A10", iconSet:"3TrafficLights"}` | 1 icon-set rule present with matching icon set | Positive |
+| C6.1 | A1:A10 with numeric values | `cell.addColorScale{sheet:"Sheet1", range:"A1:A10", scaleType:3}` | returns `true` | Positive |
+| C6.2 | A1:A10 with numeric values | `cell.addDatabar{sheet:"Sheet1", range:"A1:A10"}` | returns `true` | Positive |
+| C6.3 | A1:A10 with numeric values | `cell.addIconSetCondition{sheet:"Sheet1", range:"A1:A10"}` | returns `true`; the icon set itself is whatever `AddIconSetCondition()`'s own default is -- customizing it needs a follow-up investigation of `ApiIconSetCondition`'s own setters before adding scope fields for it | Positive |
 
 ### C7. Data validation and named ranges
 
+Backing API confirmed: `ApiRange.GetValidation()` (`apiBuilder.js:12793`) returns an `ApiValidation`; `.Add(Type, AlertStyle, Operator, Formula1, Formula2)` (19898) takes the real internal enum strings (`FromXlValidationTypeTo`/`FromXlValidationOperatorTo`, 19653/19747) -- `"xlValidateWholeNumber"`/`"xlBetween"`, not the originally-planned `"whole"`/`"between"`; corrected the scope's `type`/`operator` fields to the real string values. `ApiWorksheet.AddDefName(sName, sRef, isHidden)` (8974) **returns `false`, not a thrown exception**, for an invalid name/ref (per its own doc comment) -- the command's script converts that `false` into a thrown error, keeping this gateway's own error contract (`SCRIPT_EXCEPTION`, not a silently-ignored `false`) consistent across every command, so C7.3's expected error code is unchanged even though the underlying method itself doesn't throw.
+
 | ID | Setup | Input | Expected | Type |
 |---|---|---|---|---|
-| C7.1 | A1 no validation | `cell.addValidation{sheet:"Sheet1", range:"A1", type:"whole", operator:"between", min:1, max:10}` | setting A1 = 20 via `cell.setValue` afterward either rejects or flags invalid per validation semantics — confirm whichever behavior the underlying API has (validation may be advisory, not enforced) | Positive |
-| C7.2 | 1-sheet wb | `cell.addDefName{name:"MyRange", refersTo:"Sheet1!$A$1:$A$5"}` | reading defined names includes `"MyRange"` pointing at that range | Positive |
-| C7.3 | 1-sheet wb | `cell.addDefName{name:"1InvalidName", refersTo:"Sheet1!$A$1"}` (name starting with digit — invalid per Excel naming rules) | `Error{code: SCHEMA_INVALID}` or `SCRIPT_EXCEPTION` | Negative |
+| C7.1 | A1 no validation | `cell.addValidation{sheet:"Sheet1", range:"A1", type:"xlValidateWholeNumber", operator:"xlBetween", formula1:"1", formula2:"10"}` | returns `true`; whether `cell.setValue{...,value:20}` afterward is actually rejected is validation-enforcement behavior deferred to the §6 build/deploy gate (validation may be advisory, not enforced, at the model level) | Positive |
+| C7.2 | 1-sheet wb | `cell.addDefName{name:"MyRange", refersTo:"Sheet1!$A$1:$A$5"}` | returns `true` | Positive |
+| C7.3 | 1-sheet wb | `cell.addDefName{name:"1InvalidName", refersTo:"Sheet1!$A$1"}` (name starting with digit — invalid per Excel naming rules) | `Error{code: SCRIPT_EXCEPTION}` (the command throws on `AddDefName`'s `false` return, since the underlying method itself doesn't throw) | Negative |
 
 ### C8. AutoFilter
 
+Backing API confirmed: `ApiAutoFilter.ApplyFilter()` (`apiBuilder.js:27379`) does **not** establish a new AutoFilter over a range at all -- per its own doc comment, it only "reevaluates which rows should be visible based on the active filters" for an AutoFilter that already exists, doing nothing otherwise. Establishing a new AutoFilter range is `ApiRange.SetAutoFilter(Field, ...)` (12216) called with no arguments, which creates one if none exists (and, confusingly, *deletes* the existing one if called again with no `Field` while one is already present -- a toggle, not idempotent). Corrected `cell.applyFilter` to call `SetAutoFilter()` on the resolved range, not the differently-named/differently-behaved `ApplyFilter`. `ApiAutoFilter.GetFilters()` returns `ApiFilter[]`, unserializable -- `cell.getFilters` returns `GetFilterMode()`'s boolean instead (whether *any* AutoFilter exists on the sheet at all), same established pattern.
+
 | ID | Setup | Input | Expected | Type |
 |---|---|---|---|---|
-| C8.1 | A1:C10 tabular data with headers in row 1 | `cell.applyFilter{sheet:"Sheet1", range:"A1:C10"}` | `cell.getFilters{sheet:"Sheet1"}` reports the range as filtered | Positive |
-| C8.2 | Filtered range from C8.1 | `cell.getFilters{sheet:"Sheet1"}` on a sheet with no filter applied at all | returns empty/null, not an error | Positive (boundary) |
+| C8.1 | A1:C10 tabular data with headers in row 1 | `cell.applyFilter{sheet:"Sheet1", range:"A1:C10"}` | returns `null`; `cell.getFilters{sheet:"Sheet1"}` returns `true` | Positive |
+| C8.2 | 1-sheet wb, no filter applied at all | `cell.getFilters{sheet:"Sheet1"}` | returns `false`, not an error | Positive (boundary) |
 
 ### C9. PivotTable
 
+Backing API confirmed: there is no `AddPivotTable`/`AddPivotDataField`-as-a-single-call shape at all -- the real workflow is three distinct steps, none of which match the original design's `sourceRange`-only addressing:
+1. `Api.InsertPivotExistingWorksheet(dataRef, pivotRef, confirmation)` (`apiBuilder.js:7676`) creates the pivot table, taking real `ApiRange` objects (not strings) for both source and destination, returning an `ApiPivotTable`.
+2. `ApiWorksheet.GetPivotByName(name)` (9412) is how a pivot table is *re*-resolved in a later, separate gateway call -- there's no addressing by source range. `ApiPivotTable.GetName()`/`SetName()` (16770/16782) exist, so the create command explicitly names the table so later commands can find it.
+3. `ApiPivotTable.AddDataField(field)` (16192) returns an `ApiPivotDataField`, and **`ApiPivotField.SetFunction` (the originally-assumed target) is a hardcoded stub that always errors** ("This method can only be called on a data field... use ApiPivotTable.GetDataFields") -- the real setter is `ApiPivotDataField.SetFunction(func)` (17582), called either right after `AddDataField` or later via `ApiPivotTable.GetDataFields(field)` (16633) to re-resolve the same data field. `func` takes real enum strings (`"Sum"`, `"Average"`, `"Count"`, ... -- capitalized, not `"sum"`/`"average"`).
+
+Commands redesigned around this real shape: `cell.addPivotTable` (create + name it), `cell.addPivotDataField` (add a data field to an already-created, named table), `cell.setPivotFieldFunction` (re-resolve and set a data field's aggregation).
+
 | ID | Setup | Input | Expected | Type |
 |---|---|---|---|---|
-| C9.1 | Source data range with a "Region" and "Sales" column | `cell.addPivotDataField{sourceRange:"A1:B10", field:"Sales", function:"sum"}` | resulting pivot table has 1 data field summing "Sales" | Positive |
-| C9.2 | Pivot table created | `cell.setPivotFieldFunction{field:"Sales", function:"average"}` | data field's aggregation reads back `"average"` | Positive |
-| C9.3 | Source range with no "NoSuchColumn" | `cell.addPivotDataField{sourceRange:"A1:B10", field:"NoSuchColumn", function:"sum"}` | `Error{code: SCRIPT_EXCEPTION}` | Negative |
+| C9.1 | Source data range with a "Region" and "Sales" column in A1:B10 | `cell.addPivotTable{sourceSheet:"Sheet1", sourceRange:"A1:B10", pivotSheet:"Sheet1", pivotRange:"D1", name:"MyPivot"}` | returns `true` | Positive |
+| C9.2 | Pivot table "MyPivot" created | `cell.addPivotDataField{sheet:"Sheet1", pivotName:"MyPivot", field:"Sales", func:"Sum"}` | returns `true` | Positive |
+| C9.3 | Pivot table "MyPivot" has a "Sales" data field | `cell.setPivotFieldFunction{sheet:"Sheet1", pivotName:"MyPivot", field:"Sales", func:"Average"}` | returns `true` | Positive |
+| C9.4 | Pivot table "MyPivot", source has no "NoSuchColumn" | `cell.addPivotDataField{sheet:"Sheet1", pivotName:"MyPivot", field:"NoSuchColumn", func:"Sum"}` | `Error{code: SCRIPT_EXCEPTION}` (`AddDataField` calls `private_MakeError` and returns `null` for an unknown field -- converted to a thrown error, same pattern as elsewhere) | Negative |
 
 ### C10. Freeze panes
 
+Backing API confirmed: `ApiWorksheet.GetFreezePanes()` (`apiBuilder.js:9474`) + `ApiFreezePanes.FreezeAt(frozenRange)` (15780) -- takes a range resolved on the *active* worksheet if given as a string (`api.GetRange`, ambiguous relative to a `sheet` scope field not necessarily active), so the command resolves the range explicitly via `ws.GetRange(range)` first and passes the real `ApiRange` object instead, avoiding relying on the string-overload's own sheet-context guess.
+
 | ID | Setup | Input | Expected | Type |
 |---|---|---|---|---|
-| C10.1 | 1-sheet wb, no freeze | `cell.freezeAt{sheet:"Sheet1", range:"B2"}` | reading freeze-pane state reports rows 1 / column A frozen | Positive |
-| C10.2 | Frozen at B2 | `cell.freezeAt{sheet:"Sheet1", range:"A1"}` (freeze at origin = effectively unfreeze) | freeze-pane state reports no panes frozen | Positive (boundary) |
+| C10.1 | 1-sheet wb, no freeze | `cell.freezeAt{sheet:"Sheet1", range:"B2"}` | returns `null` | Positive |
+| C10.2 | Frozen at B2 | `cell.freezeAt{sheet:"Sheet1", range:"A1"}` (freeze at origin = effectively unfreeze, per `FreezeAt`'s own bbox-based logic) | returns `null` | Positive (boundary) |
 
 ### C11. Insert images/shapes/OLE objects
 
+Backing API confirmed: `ApiWorksheet.AddImage`/`AddOleObject` (`apiBuilder.js:9167,9228`) place objects by column/row + EMU offset, not a `range`/`path` -- `sImageSrc` is a URL or base64 data URI (same as `word.createImage`, §B9), not a local file path. `AddShape(sType, nWidth, nHeight, oFill, oStroke, ...)` (9146) requires real `ApiFill`/`ApiStroke` objects (`oFill.UniFill`, `oStroke.Ln`) -- their constructors (`Api.CreateSolidFill`/`CreateNoFill`/`CreateStroke` or similar) are not defined in `sdkjs/cell/apiBuilder.js` itself (only referenced via `Asc.editor.CreateNoFill()` at line 9198, suggesting a shared cross-editor factory not yet located in this pass). **`cell.addShape` is deferred, not guessed** -- same discipline as `word.addCheckBoxForm` (§B12) -- until the Fill/Stroke factory is confirmed.
+
 | ID | Setup | Input | Expected | Type |
 |---|---|---|---|---|
-| C11.1 | 1-sheet wb, fixture image | `cell.addImage{sheet:"Sheet1", path:"<fixture.png>", range:"A1"}` | sheet's image list length == 1 | Positive |
-| C11.2 | 1-sheet wb | `cell.addShape{sheet:"Sheet1", type:"rect", range:"A1"}` | sheet's shape list length == 1 | Positive |
-| C11.3 | 1-sheet wb, fixture OLE payload | `cell.addOleObject{sheet:"Sheet1", path:"<fixture.bin>", range:"A1"}` | sheet's OLE object list length == 1 | Positive |
+| C11.1 | 1-sheet wb, valid base64-encoded PNG fixture | `cell.addImage{sheet:"Sheet1", imageSrc:"data:image/png;base64,<fixture>", width:914400, height:914400, fromCol:0, colOffset:0, fromRow:0, rowOffset:0}` | returns `true` | Positive |
+| C11.2 | *(deferred -- see note above)* | `cell.addShape{...}` | not implemented in this pass | Deferred |
+| C11.3 | 1-sheet wb, fixture base64 OLE payload | `cell.addOleObject{sheet:"Sheet1", imageSrc:"data:image/png;base64,<preview>", width:914400, height:914400, data:"<fixture-data>", appId:"x-office/binary", fromCol:0, colOffset:0, fromRow:0, rowOffset:0}` | returns `true` | Positive |
 
 ### C12. Comments with replies
 
+Backing API confirmed: `ApiRange.AddComment(sText, sAuthor)` (`apiBuilder.js:10969`) returns an `ApiComment | null`. `ApiComment` has no public row/col accessor to re-resolve "the comment on range X" from a *separate*, later gateway call -- but it does have `GetId()` (13921, returns a string). `cell.addReply`/`cell.setSolved` therefore address a comment by the id `cell.addComment` returns, resolved via `ws.GetComments().find(c => c.GetId() === commentId)`, rather than by range -- the range-based addressing in the original design doesn't correspond to any real lookup capability.
+
 | ID | Setup | Input | Expected | Type |
 |---|---|---|---|---|
-| C12.1 | A1 no comment | `cell.addComment{sheet:"Sheet1", range:"A1", text:"check this", author:"peter"}` | comment present on A1 with matching text/author | Positive |
-| C12.2 | A1 has 1 comment | `cell.addReply{sheet:"Sheet1", range:"A1", text:"done", author:"jane"}` | comment thread on A1 has 2 entries in order | Positive |
-| C12.3 | A1 has a comment thread | `cell.setSolved{sheet:"Sheet1", range:"A1", solved:true}` | comment reads back `solved:true` | Positive |
+| C12.1 | A1 no comment | `cell.addComment{sheet:"Sheet1", range:"A1", text:"check this", author:"peter"}` | returns the new comment's id (a non-empty string) | Positive |
+| C12.2 | A1 has 1 comment with id from C12.1 | `cell.addReply{sheet:"Sheet1", commentId:"<id>", text:"done", author:"jane"}` | returns `null`; the comment's reply count increases by 1 | Positive |
+| C12.3 | A1 has a comment with id from C12.1 | `cell.setSolved{sheet:"Sheet1", commentId:"<id>", solved:true}` | returns `null` | Positive |
 
 ### C13. Insert/delete rows and columns
 
+Backing API confirmed: `ApiWorksheet.GetRangeByNumber(nRow, nCol)` (`apiBuilder.js:8642`) resolves 0-based grid coordinates directly (`worksheet.getCell3`), matching this document's established row/col index convention -- used to anchor `GetEntireRow()`/`GetEntireColumn()` (12753, 12775) before `Insert(shift)`/`Delete(shift)` (11280, 11241), which take a shift direction string and return nothing.
+
 | ID | Setup | Input | Expected | Type |
 |---|---|---|---|---|
-| C13.1 | A1="x", A2="y" | `cell.insertEntireRow{sheet:"Sheet1", rowIndex:1}` | new blank row at index 1; former A2("y") is now A3 | Positive |
-| C13.2 | A1="x", B1="y" | `cell.deleteEntireColumn{sheet:"Sheet1", colIndex:0}` | column A removed; former B1("y") is now A1 | Positive |
+| C13.1 | A1="x", A2="y" | `cell.insertEntireRow{sheet:"Sheet1", rowIndex:1}` | returns `null`; new blank row at index 1; former A2("y") is now A3 | Positive |
+| C13.2 | A1="x", B1="y" | `cell.deleteEntireColumn{sheet:"Sheet1", colIndex:0}` | returns `null`; column A removed; former B1("y") is now A1 | Positive |
 | C13.3 | 1-sheet wb | `cell.insertEntireRow{sheet:"Sheet1", rowIndex:-1}` | `Error{code: SCHEMA_INVALID}` (schema `minimum:0`) | Negative |
 
 ### C14. Recalculate formulas
@@ -308,17 +340,21 @@ Fixture convention: "1-sheet wb" = workbook with a single sheet "Sheet1", A1:C3 
 
 ### C15. Create charts and edit data series
 
+Backing API confirmed: `ApiWorksheet.GetAllCharts()` (`apiBuilder.js:9359`) is the addressing mechanism -- `chartIndex` indexes into it, matching this document's established index-based pattern already, no redesign needed (unlike §C9/§C12's name/id-based fixes, `ApiChart` has no `GetName`/`SetName` at all, so index-into-`GetAllCharts()` is in fact the *only* real addressing option). `ApiChart.AddSeria(sNameRange, sValuesRange, sXValuesRange)` (13641) and `SetSeriaName(sNameRange, nSeria)` (13608) both take **range strings** (or plain text for the name) rather than a single `range`/`name` scalar -- `cell.addSeria`'s `range` scope field maps to `sValuesRange` (with name left blank/auto), and `cell.setSeriaName`'s `name` field is passed as `sNameRange`, which the underlying method accepts as either a formula range or literal text per its own doc comment. Chart *creation* (`ApiWorksheet.AddChart`, 9098) is out of scope for this family per the original design (fixtures assume a pre-existing chart) -- not added speculatively.
+
 | ID | Setup | Input | Expected | Type |
 |---|---|---|---|---|
-| C15.1 | Sheet with 1 chart, 1 series | `cell.addSeria{chartIndex:0, range:"Sheet1!B1:B10"}` | chart now has 2 series | Positive |
-| C15.2 | Sheet with 1 chart, 1 series named "Old" | `cell.setSeriaName{chartIndex:0, seriaIndex:0, name:"Revenue"}` | series name reads back `"Revenue"` | Positive |
+| C15.1 | Sheet with 1 chart, 1 series | `cell.addSeria{sheet:"Sheet1", chartIndex:0, valuesRange:"Sheet1!B1:B10"}` | returns `null`; chart now has 2 series | Positive |
+| C15.2 | Sheet with 1 chart, 1 series named "Old" | `cell.setSeriaName{sheet:"Sheet1", chartIndex:0, seriaIndex:0, name:"Revenue"}` | returns `true` | Positive |
 
 ### C16. Read SmartArt object type
 
+Backing API confirmed: `ApiSmartArt` (`apiBuilder.js:13294`) is one variant of the generic `Drawing` typedef (313: `ApiShape | ApiImage | ApiOleObject | ApiChart | ApiGroup | ApiSmartArt`) -- there is no SmartArt-specific collection accessor; `index` addresses into `ApiWorksheet.GetAllDrawings()` (9271), the generic mixed-type collection, not a SmartArt-only one.
+
 | ID | Setup | Input | Expected | Type |
 |---|---|---|---|---|
-| C16.1 | Sheet with 1 SmartArt object of a known class | `cell.getSmartArtClassType{sheet:"Sheet1", index:0}` | returns the expected type string, matching the fixture | Positive |
-| C16.2 | Sheet with no SmartArt objects | `cell.getSmartArtClassType{sheet:"Sheet1", index:0}` | `Error{code: SCRIPT_EXCEPTION}` (index out of range on empty collection) | Negative |
+| C16.1 | Sheet with 1 SmartArt object of a known class at drawing index 0 | `cell.getSmartArtClassType{sheet:"Sheet1", index:0}` | returns the expected type string, matching the fixture | Positive |
+| C16.2 | Sheet with no drawings at all | `cell.getSmartArtClassType{sheet:"Sheet1", index:0}` | `Error{code: SCRIPT_EXCEPTION}` (accessing `.GetClassType()` on `undefined` throws a plain JS `TypeError`, propagated the same as any other script exception) | Negative |
 
 ---
 
@@ -328,92 +364,113 @@ Fixture convention: "3-slide deck" = presentation with 3 slides, slide 0 has 1 t
 
 ### D1. Slide management
 
+Backing API confirmed: `ApiPresentation.AddSlide(oSlide, nIndex)` (`sdkjs/slide/apiBuilder.js:1365`) needs an actual `ApiSlide` built via `Api.CreateSlide()` (805), not a bare index -- an out-of-range `nIndex` is silently treated as "append at end", not an error. `RemoveSlides(nStart, nCount)` (1564) takes a **contiguous start+count range**, not an arbitrary `indices` array as originally planned -- and **returns `false` rather than throwing** for an out-of-range `nStart` (the whole removal block is skipped silently); the command's script converts that `false` into a thrown error, same pattern as elsewhere in this document. `ApiSlide.Duplicate(nPos)`/`MoveTo(nPos)` (3853, 3872) are called on a resolved `ApiSlide` (via `ApiPresentation.GetSlideByIndex`, 1324), not `ApiPresentation` directly.
+
 | ID | Setup | Input | Expected | Type |
 |---|---|---|---|---|
-| D1.1 | 3-slide deck | `slide.addSlide{index:1}` | deck now has 4 slides; new slide is at position 1 | Positive |
-| D1.2 | 3-slide deck | `slide.removeSlides{indices:[1]}` | deck now has 2 slides; former slide 2 is now slide 1 | Positive |
-| D1.3 | 3-slide deck | `slide.duplicate{index:0}` | deck now has 4 slides; slide at index 1 has content matching original slide 0 | Positive |
-| D1.4 | 3-slide deck | `slide.moveTo{index:0, newIndex:2}` | slide originally at 0 is now at 2; others shift accordingly | Positive |
-| D1.5 | 3-slide deck | `slide.removeSlides{indices:[99]}` (out of range) | `Error{code: SCRIPT_EXCEPTION}` | Negative |
-| D1.6 | 1-slide deck (only slide) | `slide.removeSlides{indices:[0]}` | either succeeds (deck with 0 slides, if the app allows it) or `Error{code: SCRIPT_EXCEPTION}` — pin behavior since a presentation with 0 slides may be invalid | Positive or Negative (decide) |
+| D1.1 | 3-slide deck | `slide.addSlide{index:1}` | returns `null`; deck now has 4 slides, new slide at position 1 | Positive |
+| D1.2 | 3-slide deck | `slide.removeSlides{start:1, count:1}` | returns `true`; deck now has 2 slides; former slide 2 is now slide 1 | Positive |
+| D1.3 | 3-slide deck | `slide.duplicate{index:0}` | returns `true`; deck now has 4 slides; slide at index 1 has content matching original slide 0 | Positive |
+| D1.4 | 3-slide deck | `slide.moveTo{index:0, newIndex:2}` | returns `true`; slide originally at 0 is now at 2; others shift accordingly | Positive |
+| D1.5 | 3-slide deck | `slide.removeSlides{start:99, count:1}` (out of range) | `Error{code: SCRIPT_EXCEPTION}` (converted from `RemoveSlides`'s own `false` return, since the underlying method itself doesn't throw) | Negative |
+| D1.6 | 1-slide deck (only slide) | `slide.removeSlides{start:0, count:1}` | returns `true` -- `RemoveSlides`'s own bounds check (`nStart < GetSlidesCount()`) has no special guard against reaching 0 slides, confirmed in source; whether a 0-slide presentation is a stable runtime state isn't verifiable from source alone, deferred to the §6 build/deploy gate | Positive |
 
 ### D2. Enumerate slide content
 
+Backing API confirmed: `ApiSlide.GetAllShapes/GetAllImages/GetAllTables/GetAllCharts` (`sdkjs/slide/apiBuilder.js:4140,4155,4197,4169`) match the plan exactly, each returning `Api*[]` -- not JSON-serializable, same established pattern as `word.getAllTables` (§B2) -- so these return index arrays (`0..length-1`) instead. `index` addresses the slide via `ApiPresentation.GetSlideByIndex` (§D1's resolveSlide), not the slide's content directly.
+
 | ID | Setup | Input | Expected | Type |
 |---|---|---|---|---|
-| D2.1 | Slide with 2 shapes, 1 image, 1 table, 1 chart | `slide.getAllShapes{index:0}` | length 2 | Positive |
-| D2.2 | same fixture | `slide.getAllImages{index:0}` | length 1 | Positive |
-| D2.3 | same fixture | `slide.getAllTables{index:0}` | length 1 | Positive |
-| D2.4 | same fixture | `slide.getAllCharts{index:0}` | length 1 | Positive |
+| D2.1 | Slide with 2 shapes, 1 image, 1 table, 1 chart | `slide.getAllShapes{index:0}` | returns `[0,1]` | Positive |
+| D2.2 | same fixture | `slide.getAllImages{index:0}` | returns `[0]` | Positive |
+| D2.3 | same fixture | `slide.getAllTables{index:0}` | returns `[0]` | Positive |
+| D2.4 | same fixture | `slide.getAllCharts{index:0}` | returns `[0]` | Positive |
 | D2.5 | blank slide | `slide.getAllShapes{index:2}` (empty slide) | returns empty array, not an error | Positive (boundary) |
 
-### D3. Apply layouts, masters, themes
+### D3. Apply layouts, masters, themes (theme application deferred)
+
+Backing API confirmed: layouts/masters/themes have no id-string addressing at all -- `ApiSlide.GetLayout()`/`ApplyLayout(oLayout)` (`sdkjs/slide/apiBuilder.js:4092,3800`) work with real `ApiLayout` objects, `ApiPresentation.AddMaster(nPos, oApiMaster)` (1522) needs a real `ApiMaster` (from `Api.CreateMaster(oTheme)`, 553), and `ApplyTheme(oApiTheme)` (1545) needs a real `ApiTheme`. `Api.CreateTheme(sName, oMaster, oClrScheme, oFormatScheme, oFontScheme)` (640) requires **three further factory-built objects** (`ApiThemeColorScheme`/`ApiThemeFormatScheme`/`ApiThemeFontScheme`) whose own constructors weren't confirmed in this pass -- **`slide.applyTheme` is deferred, not guessed**, same discipline as `word.addCheckBoxForm` (§B12) and `cell.addShape` (§C11). `slide.applyLayout` is redesigned around borrowing an already-resolved layout from another slide (`GetLayout()` → `ApplyLayout()`), which only needs methods already confirmed, rather than a `layoutId` string that doesn't correspond to any real lookup. `slide.addMaster` uses `Api.CreateMaster()` with no theme argument, relying on its own documented fallback (defaults to the presentation's existing master-0 theme, or the current theme if none) rather than us constructing one.
 
 | ID | Setup | Input | Expected | Type |
 |---|---|---|---|---|
-| D3.1 | slide with default layout | `slide.getLayout{index:0}` then `slide.applyLayout{index:0, layoutId:<a different known layout>}` | slide's layout reads back the new layout id | Positive |
-| D3.2 | deck with 1 master | `slide.addMaster{}` | deck's master count increases by 1 | Positive |
-| D3.3 | deck with default theme | `slide.applyTheme{themeId:"Office"}` | deck's active theme reads back `"Office"` | Positive |
+| D3.1 | slide with default layout | `slide.getLayout{index:0}` | returns `true` (has a layout) | Positive |
+| D3.2 | Two slides with different layouts | `slide.applyLayout{index:0, fromIndex:1}` | returns `true`; slide 0 now uses slide 1's layout | Positive |
+| D3.3 | deck with 1 master | `slide.addMaster{position:1}` | returns `true`; deck's master count increases by 1 | Positive |
+| D3.4 | *(deferred -- see note above)* | `slide.applyTheme{...}` | not implemented in this pass | Deferred |
 
-### D4. Set background, transitions
+### D4. Set transitions (background deferred)
+
+Backing API confirmed: `ApiSlide.SetBackground(oApiFill)` (`sdkjs/slide/apiBuilder.js:3723`) needs a real `ApiFill` object -- no `Api.CreateSolidFill`-style factory was found in this file (only `Api.CreateNoFill`, confirmed, and `Api.CreateStroke`), so **`slide.setBackground` is deferred, not guessed**, same discipline as `word.addCheckBoxForm` (§B12), `cell.addShape` (§C11), `slide.applyTheme` (§D3). `ApiSlide.SetSlideShowTransition(transition)` (4389) needs a real `ApiSlideShowTransition` from `Api.CreateSlideShowTransition()` (1075, no-arg, confirmed) configured via `SetEntryEffect(entryEffectName)`/`SetDuration(duration)` (4848, 4902) -- the field is `entryEffect`, not `type`, and `SetEntryEffect` returns `false` (not a throw) for an unsupported name.
 
 | ID | Setup | Input | Expected | Type |
 |---|---|---|---|---|
-| D4.1 | slide default (no) background | `slide.setBackground{index:0, color:"#00FF00"}` | background reads back `#00FF00` | Positive |
-| D4.2 | slide, no transition | `slide.setTransition{index:0, type:"fade", duration:500}` | transition reads back `{type:"fade", duration:500}` | Positive |
+| D4.1 | *(deferred -- see note above)* | `slide.setBackground{...}` | not implemented in this pass | Deferred |
+| D4.2 | slide, no transition | `slide.setTransition{index:0, entryEffect:"effectFade", duration:500}` | returns `true` | Positive |
 
 ### D5. Insert shapes/text boxes with positioning
 
+Backing API confirmed: `Api.CreateShape(sType, nWidth, nHeight, oFill, oStroke)` (`sdkjs/slide/apiBuilder.js:870`) has real internal defaults for `oFill`/`oStroke` (falls back to `Api.CreateNoFill()`/`Api.CreateStroke(0, Api.CreateNoFill())` when omitted) -- unlike Cell's `AddShape` (§C11), this one doesn't need us to construct fill/stroke objects, so it's fully implementable. `CreateShape` doesn't take a position -- the shape is attached to a slide via `ApiSlide.AddObject(oDrawing)` (3621) and positioned separately via `ApiDrawing.SetPosition(nPosX, nPosY)` (6100), so `slide.createShape`'s `x`/`y` map to a follow-up `SetPosition` call in the same command, not `CreateShape` itself. `SetSize`/`SetRotation` (6079, 6511) confirmed as planned.
+
 | ID | Setup | Input | Expected | Type |
 |---|---|---|---|---|
-| D5.1 | blank slide | `slide.createShape{index:0, type:"rect", x:10, y:10, width:100, height:50}` | `slide.getAllShapes{index:0}` length 1, position matches | Positive |
-| D5.2 | shape created | `slide.setPosition{index:0, shapeIndex:0, x:200, y:200}` | position reads back `{200,200}` | Positive |
-| D5.3 | shape created | `slide.setRotation{index:0, shapeIndex:0, degrees:45}` | rotation reads back `45` | Positive |
+| D5.1 | blank slide | `slide.createShape{index:0, type:"rect", x:10, y:10, width:100, height:50}` | returns `true` | Positive |
+| D5.2 | shape created | `slide.setPosition{index:0, shapeIndex:0, x:200, y:200}` | returns `null` | Positive |
+| D5.3 | shape created | `slide.setRotation{index:0, shapeIndex:0, degrees:45}` | returns `true` | Positive |
 | D5.4 | shape created | `slide.setSize{index:0, shapeIndex:0, width:-10, height:50}` (negative width) | `Error{code: SCHEMA_INVALID}` (schema `minimum:0`) | Negative |
 
 ### D6. Text formatting
 
-Same command handlers as Word's `ApiTextPr.SetBold/SetFontFamily` per the plan's note — these test cases exist to prove the *slide-side target resolution* works, not to re-derive formatting semantics already covered in B4.
+`ApiRun.SetBold`/`SetFontFamily` are shared classes with Word (confirmed absent from `sdkjs/slide/apiBuilder.js` itself, so they must come from a common file included by all three editors, per the plan's own note) -- these test cases exist to prove the *slide-side target resolution* works, not to re-derive formatting semantics already covered in §B4. Target resolution: `ApiShape.GetContent()` (`sdkjs/slide/apiBuilder.js:6975`, `GetDocContent` is its deprecated alias) returns an `ApiDocumentContent`, navigated the same `GetElement(paraIndex).GetElement(runIndex)` chain as Word (§B3/§B4) -- the originally-planned scope was missing `paraIndex` (a text box's run still lives inside a paragraph), added below.
 
 | ID | Setup | Input | Expected | Type |
 |---|---|---|---|---|
-| D6.1 | slide 0 has 1 text box with 1 run | `slide.setBold{index:0, shapeIndex:0, runIndex:0, bold:true}` | run's bold reads back `true` | Positive |
-| D6.2 | same fixture | `slide.setFontFamily{index:0, shapeIndex:0, runIndex:0, font:"Georgia"}` | font reads back `"Georgia"` | Positive |
+| D6.1 | slide 0 has 1 text box with 1 paragraph, 1 run | `slide.setBold{index:0, shapeIndex:0, paraIndex:0, runIndex:0, bold:true}` | returns `null` | Positive |
+| D6.2 | same fixture | `slide.setFontFamily{index:0, shapeIndex:0, paraIndex:0, runIndex:0, font:"Georgia"}` | returns `null` | Positive |
 
 ### D7. Insert images
 
-| ID | Setup | Input | Expected | Type |
-|---|---|---|---|---|
-| D7.1 | blank slide, fixture image | `slide.createImage{index:0, path:"<fixture.png>", x:0, y:0, width:100, height:100}` | `slide.getAllImages{index:0}` length 1 | Positive |
-
-### D8. Table creation and editing
+Backing API confirmed: `Api.CreateImage(sImageSrc, nWidth, nHeight)` (`sdkjs/slide/apiBuilder.js:825`) matches the Word/Cell precedent exactly -- `sImageSrc` is a URL or base64 data URI, not a local file path (correcting the originally-planned `path`, same fix as `word.createImage` §B9). No position param -- attached via `ApiSlide.AddObject` (§D5) then positioned via `ApiDrawing.SetPosition` (§D5), same two-step pattern as `slide.createShape`.
 
 | ID | Setup | Input | Expected | Type |
 |---|---|---|---|---|
-| D8.1 | blank slide | `slide.createTable{index:0, rows:2, cols:2, x:0, y:0}` | `slide.getAllTables{index:0}` length 1, 2x2 | Positive |
-| D8.2 | slide with 1 table, 2x2 | `slide.addRow{index:0, tableIndex:0, rowIndex:1}` | table now 3 rows | Positive |
+| D7.1 | blank slide, valid base64-encoded PNG fixture | `slide.createImage{index:0, imageSrc:"data:image/png;base64,<fixture>", x:0, y:0, width:914400, height:914400}` | returns `true` | Positive |
+
+### D8. Table editing (creation deferred)
+
+Backing API confirmed: `Api.CreateTable(nCols, nRows)` (`sdkjs/slide/apiBuilder.js:947`) places the table on **whatever slide `private_GetCurrentSlide()` currently resolves to** (`ApiPresentation.GetCurSlideIndex()`) -- there is no `ApiPresentation.SetCurSlideIndex`-style public setter to target an arbitrary slide by index first, unlike `AddSlide`'s own internal `CurPage` manipulation. Reliably creating a table on a specific slide via automation therefore isn't possible with the confirmed API surface -- **`slide.createTable` is deferred, not guessed**, same discipline as `slide.applyTheme`/`slide.setBackground`. `ApiTable.AddRow`/`MergeCells` (7412, 7314) operate on an **already-existing** table, addressed via `slide.GetAllTables()[tableIndex]` (§D2's established index space) -- fully implementable regardless of the creation gap. Cell resolution for `MergeCells` uses `ApiTable.GetRow(r).GetCell(c)` (7295, `ApiTableRow.GetCell`, 7614) -- slide's `ApiTable` has **no** `GetCell(row, col)` shortcut the way Word's does.
+
+| ID | Setup | Input | Expected | Type |
+|---|---|---|---|---|
+| D8.1 | *(deferred -- see note above)* | `slide.createTable{...}` | not implemented in this pass | Deferred |
+| D8.2 | slide with 1 table, 2x2 | `slide.addRow{index:0, tableIndex:0}` | returns `true`; table now 3 rows | Positive |
 | D8.3 | slide with 1 table, 2x2 | `slide.mergeCells{index:0, tableIndex:0, fromRow:0, fromCol:0, toRow:0, toCol:1}` | resulting merged cell spans 2 columns | Positive |
 
 ### D9. Speaker notes
 
+Backing API confirmed: `ApiSlide.AddNotesText(sText)` (`sdkjs/slide/apiBuilder.js:4331`) creates the notes page if missing, then calls `ApiParagraph.AddText(sText)` on its first paragraph -- **the same append-only semantics as `word.addText`** (§B3, `AddText` always appends a new run, never replaces) -- resolving D9.2's originally-open "append vs. replace" question definitively: it appends. `slide.getNotesText` (not in the original design at all) added here as the real read-back path: `GetNotesPage().GetBodyShape().GetDocContent().GetElement(0)`, then `ApiParagraph.GetText()` (shared class, confirmed in `sdkjs/word/apiBuilder.js:11261`) -- without it, D9.1's expectation ("text contains...") had no allowlisted command to verify it with.
+
 | ID | Setup | Input | Expected | Type |
 |---|---|---|---|---|
-| D9.1 | slide 0, no notes | `slide.addNotesText{index:0, text:"Remember to mention Q3"}` | `slide.getNotesPage{index:0}` text contains `"Remember to mention Q3"` | Positive |
-| D9.2 | slide 0, notes already set | `slide.addNotesText{index:0, text:"Second note"}` (appending vs. replacing — pin behavior) | notes content reflects whichever is the defined behavior (append or replace); test locks it in | Positive |
+| D9.1 | slide 0, no notes | `slide.addNotesText{index:0, text:"Remember to mention Q3"}` | returns `true`; `slide.getNotesText{index:0}` returns `"Remember to mention Q3"` | Positive |
+| D9.2 | slide 0, notes already set to "First" | `slide.addNotesText{index:0, text:"Second"}` | returns `true`; `slide.getNotesText{index:0}` now returns `"FirstSecond"` (`AddText` appends a new run with no separator inserted, confirmed in source) | Positive |
 
 ### D10. Comments
 
+Backing API confirmed: `ApiSlide.AddComment(posX, posY, text, author, userId)` (`sdkjs/slide/apiBuilder.js:3649`) takes an EMU position -- `x`/`y` added to the originally-planned scope, which omitted them. `ApiPresentation.GetAllComments()` (1697) returns `ApiComment[]` via the same shared `ApiComment` class as Word (`GetText`/`GetAuthorName`, §B13) -- returned as plain `{text, author}` objects, same established pattern.
+
 | ID | Setup | Input | Expected | Type |
 |---|---|---|---|---|
-| D10.1 | slide 0, no comments | `slide.addComment{index:0, text:"fix typo", author:"peter"}` | `presentation.getAllComments{}` length 1, matches text/author, references slide 0 | Positive |
-| D10.2 | deck with no comments anywhere | `presentation.getAllComments{}` | returns empty array, not an error | Positive (boundary) |
+| D10.1 | slide 0, no comments | `slide.addComment{index:0, x:0, y:0, text:"fix typo", author:"peter"}` | returns `true`; `presentation.getAllComments{}` returns `[{text:"fix typo", author:"peter"}]` | Positive |
+| D10.2 | deck with no comments anywhere | `presentation.getAllComments{}` | returns `[]`, not an error | Positive (boundary) |
 
 ### D11. Document properties
 
+Backing API confirmed: `ApiPresentation.GetDocumentInfo()` (`sdkjs/slide/apiBuilder.js:1849`) returns a **plain JS object of primitives/string arrays** -- already JSON-safe, no conversion needed, unlike almost everything else in this document. `GetCustomProperties()` (1936) returns the same shared `ApiCustomProperties` class as Word (`Get(name)`/`Add(name,value)`, no `GetAll`, §B1) -- `presentation.getCustomProperties` corrected to `presentation.getCustomProperty{name}` (singular), same fix as `word.getCustomProperty`.
+
 | ID | Setup | Input | Expected | Type |
 |---|---|---|---|---|
-| D11.1 | fresh deck | `presentation.getDocumentInfo{}` | returns a well-formed info object (title/author/etc, even if defaults) | Positive |
-| D11.2 | fresh deck, custom prop set via fixture | `presentation.getCustomProperties{}` | returns the fixture's custom properties | Positive |
+| D11.1 | fresh deck | `presentation.getDocumentInfo{}` | returns the info object directly (`{Application, Created, LastModified, LastModifiedBy, Authors, Title, Tags, Subject, Comment, ...}`, even if fields are empty defaults) | Positive |
+| D11.2 | fresh deck, custom prop "Reviewed"="true" set via fixture | `presentation.getCustomProperty{name:"Reviewed"}` | returns `"true"` | Positive |
 
 ---
 
